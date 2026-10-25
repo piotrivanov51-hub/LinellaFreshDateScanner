@@ -1,0 +1,142 @@
+          import android.content.pm.PackageManager;
+          import android.graphics.Bitmap;
+          import android.graphics.BitmapFactory;
+          import android.os.Bundle;
+          import android.util.Base64;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebView;
+          import androidx.core.app.ActivityCompat;
+          import androidx.core.content.ContextCompat;
+          import com.getcapacitor.BridgeActivity;
+          import com.google.mlkit.vision.barcode.BarcodeScanner;
+          import com.google.mlkit.vision.barcode.BarcodeScanning;
+          import com.google.mlkit.vision.barcode.common.Barcode;
+          import com.google.mlkit.vision.common.InputImage;
+          import com.google.mlkit.vision.text.TextRecognition;
+          import com.google.mlkit.vision.text.TextRecognizer;
+          import com.google.mlkit.vision.text.latin.TextRecognizerOptions;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+          import java.util.concurrent.atomic.AtomicBoolean;
+          import org.json.JSONObject;
+
+          public class MainActivity extends BridgeActivity {
+              private BarcodeScanner barcodeScanner;
+              private TextRecognizer textRecognizer;
+              private ExecutorService mlExecutor;
+              private final AtomicBoolean isMlKitBusy = new AtomicBoolean(false);
+
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  barcodeScanner = BarcodeScanning.getClient();
+                  textRecognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS);
+                  mlExecutor = Executors.newSingleThreadExecutor();
+
+                  if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                      ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO}, 101);
+                  }
+                  try {
+                      WebView webView = getBridge().getWebView();
+                      if (webView != null) {
+                          webView.addJavascriptInterface(new AndroidMlKitBridge(), "AndroidMlKit");
+                      }
+                  } catch (Exception ignored) {}
+              }
+
+              @Override
+              public void onDestroy() {
+                  try {
+                      if (barcodeScanner != null) barcodeScanner.close();
+                      if (textRecognizer != null) textRecognizer.close();
+                      if (mlExecutor != null) mlExecutor.shutdownNow();
+                  } catch (Exception ignored) {}
+                  super.onDestroy();
+              }
+
+              public class AndroidMlKitBridge {
+                  @JavascriptInterface
+                  public boolean isNativeMlKitAvailable() {
+                      return true;
+                  }
+
+                  @JavascriptInterface
+                  public void scanFrameAsync(final String base64Jpeg, final String mode) {
+                      if (!isMlKitBusy.compareAndSet(false, true)) {
+                          return;
+                      }
+                      mlExecutor.execute(() -> {
+                          try {
+                              byte[] decoded = Base64.decode(base64Jpeg, Base64.DEFAULT);
+                              Bitmap bitmap = BitmapFactory.decodeByteArray(decoded, 0, decoded.length);
+                              if (bitmap == null) {
+                                  sendResult("", "");
+                                  return;
+                              }
+                              InputImage image = InputImage.fromBitmap(bitmap, 0);
+                              barcodeScanner.process(image)
+                                  .addOnSuccessListener(barcodes -> {
+                                      String bcValue = "";
+                                      if (barcodes != null && !barcodes.isEmpty()) {
+                                          for (Barcode b : barcodes) {
+                                              if (b.getRawValue() != null && !b.getRawValue().isEmpty()) {
+                                                  bcValue = b.getRawValue();
+                                                  break;
+                                              }
+                                          }
+                                      }
+                                      final String finalBc = bcValue;
+                                      if ("barcode_only".equals(mode) && !finalBc.isEmpty()) {
+                                          bitmap.recycle();
+                                          sendResult(finalBc, "");
+                                          return;
+                                      }
+                                      textRecognizer.process(image)
+                                          .addOnSuccessListener(visionText -> {
+                                              String txt = visionText != null ? visionText.getText() : "";
+                                              bitmap.recycle();
+                                              sendResult(finalBc, txt);
+                                          })
+                                          .addOnFailureListener(e -> {
+                                              bitmap.recycle();
+                                              sendResult(finalBc, "");
+                                          });
+                                  })
+                                  .addOnFailureListener(e -> {
+                                      bitmap.recycle();
+                                      sendResult("", "");
+                                  });
+                          } catch (Exception e) {
+                              sendResult("", "");
+                          }
+                      });
+                  }
+
+                  private void sendResult(final String barcode, final String text) {
+                      isMlKitBusy.set(false);
+                      runOnUiThread(() -> {
+                          try {
+                              JSONObject obj = new JSONObject();
+                              obj.put("barcode", barcode != null ? barcode : "");
+                              obj.put("text", text != null ? text : "");
+                              String js = "if(window.onNativeMlKitResult){window.onNativeMlKitResult(" + obj.toString() + ");}";
+                              getBridge().getWebView().evaluateJavascript(js, null);
+                          } catch (Exception ignored) {}
+                      });
+                  }
+              }
+          }
+          JAVA
+
+      - name: Build APK with Gradle
+        working-directory: ./build_app/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug
+          cp app/build/outputs/apk/debug/app-debug.apk ../../Linella_Fresh_PRO.apk
+
+      - name: Upload APK to Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Linella-Fresh-PRO-Android-APK
+          path: Linella_Fresh_PRO.apk
